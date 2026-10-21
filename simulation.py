@@ -80,6 +80,9 @@ class WeatherData(Schema):
     precipitation_mm: float = Field(ge=0, le=1000)
     condition: str = "Forecast"
     date: str = ""
+    provider: str = ""
+    fetched_at: str = ""
+    cached: bool = False
 
 
 class SimRequest(Schema):
@@ -96,137 +99,223 @@ def distance_m(lat1, lng1, lat2, lng2):
     return math.hypot(north, east)
 
 
-# Share recent validated forecasts between simulation runs in this worker.
+
+# Cache full validated sequences; metadata stays attached to the chosen provider.
 _WEATHER_CACHE = {}
 _WEATHER_LOCK = Lock()
 _WEATHER_TTL_SECONDS = 1800
-_WEATHER_BLOCKED_UNTIL = 0.0
-_WEATHER_LIMIT_REASON = ""
+_WEATHER_COOLDOWNS = {}
+
+
+class ProviderFailure(Exception):
+    def __init__(self, message, cooldown=60):
+        super().__init__(message)
+        self.cooldown = cooldown
+
+
+def weather_provider_order(days):
+    # Free WeatherAPI includes today, leaving two full days from tomorrow.
+    providers = []
+    if days <= 2 and os.getenv("WEATHERAPI_KEY", "").strip():
+        providers.append("WeatherAPI")
+    providers.append("Open-Meteo")
+    if os.getenv("VISUAL_CROSSING_API_KEY", "").strip():
+        providers.append("Visual Crossing")
+    return providers
+
+
+def _retry_delay(headers, reason):
+    delay = 3600 if "hour" in reason.lower() else 60
+    if "daily" in reason.lower() or "day" in reason.lower():
+        now = datetime.now(timezone.utc)
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        delay = max(60, math.ceil((midnight - now).total_seconds()))
+    value = headers.get("Retry-After") if headers else None
+    if value:
+        try:
+            return max(1, int(value))
+        except ValueError:
+            try:
+                return max(1, math.ceil(parsedate_to_datetime(value).timestamp() - time.time()))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return delay
+
+
+def _weather_json(url):
+    # One bounded attempt per provider; fail over instead of multiplying retries.
+    try:
+        with urlopen(url, timeout=8) as response:
+            data = json.load(response)
+        if not isinstance(data, dict):
+            raise ProviderFailure("Invalid forecast response")
+        if data.get("error"):
+            error = data["error"]
+            code = error.get("code") if isinstance(error, dict) else None
+            if code == 2007:
+                raise ProviderFailure("Monthly quota exceeded", 3600)
+            if code in (1002, 2006, 2008, 2009):
+                raise ProviderFailure("API key missing, invalid or not authorized for this forecast", 300)
+            raise ProviderFailure("Provider rejected the forecast request")
+        return data
+    except HTTPError as exc:
+        reason = ""
+        try:
+            body = json.loads(exc.read())
+            error = body.get("error", {})
+            reason = str(body.get("reason") or (error.get("message") if isinstance(error, dict) else ""))[:300]
+            code = error.get("code") if isinstance(error, dict) else None
+        except (ValueError, OSError, AttributeError):
+            code = None
+        if exc.code == 429 or code == 2007:
+            # Do not return provider URLs/messages that might echo credentials.
+            quota = "daily" if "daily" in reason.lower() else "hourly" if "hour" in reason.lower() else "request"
+            raise ProviderFailure(f"{quota.capitalize()} rate limit reached", _retry_delay(exc.headers, reason)) from None
+        if exc.code in (401, 403) or code in (1002, 2006, 2008, 2009):
+            raise ProviderFailure("API key invalid or plan does not allow this forecast", 300) from None
+        raise ProviderFailure(f"Provider HTTP {exc.code}", 60) from None
+    except (OSError, TimeoutError):
+        raise ProviderFailure("Connection failed or timed out", 60) from None
+    except (ValueError, TypeError):
+        raise ProviderFailure("Invalid forecast JSON", 60) from None
+
+
+def _forecast_dates(days):
+    today = datetime.now(LOCAL_TZ).date()
+    return [(today + timedelta(days=i)).isoformat() for i in range(1, days + 1)]
+
+
+def _aggregate_hours(date, rows):
+    if len(rows) != 24 or len({row[0] for row in rows}) != 24:
+        raise ValueError(f"Expected 24 distinct hourly forecasts for {date}")
+    # Row format: timestamp, temperature C, humidity %, wind km/h, direction, rain mm.
+    values = [[float(v) for v in row[1:]] for row in rows]
+    if any(len(v) != 5 or not all(math.isfinite(x) for x in v) for v in values):
+        raise ValueError("Missing/non-finite hourly weather values")
+    if any(not (-60 <= v[0] <= 60 and 0 <= v[1] <= 100 and 0 <= v[2] <= 250
+                and 0 <= v[3] <= 360 and 0 <= v[4] <= 1000) for v in values):
+        raise ValueError("Hourly weather values out of range")
+    east = sum(v[2] * math.sin(math.radians(v[3])) for v in values)
+    north = sum(v[2] * math.cos(math.radians(v[3])) for v in values)
+    rain = sum(v[4] for v in values)
+    return WeatherData(date=date, temp_c=round(sum(v[0] for v in values) / 24, 2),
+        humidity=round(sum(v[1] for v in values) / 24, 2),
+        wind_kph=round(sum(v[2] for v in values) / 24, 2),
+        wind_direction_deg=round(math.degrees(math.atan2(east, north)) % 360, 2),
+        precipitation_mm=round(rain, 2),
+        condition="Rain forecast" if rain >= 1 else "Little or no rain forecast")
+
+
+def _fetch_provider(provider, lat, lng, days):
+    dates = _forecast_dates(days)
+    if provider == "Open-Meteo":
+        parameters = {"latitude": lat, "longitude": lng, "timezone": "Asia/Manila",
+            "forecast_days": days + 1, "wind_speed_unit": "kmh",
+            "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation"}
+        key = os.getenv("OPEN_METEO_API_KEY", "").strip()
+        endpoint = "https://api.open-meteo.com/v1/forecast"
+        if key:
+            parameters["apikey"] = key
+            endpoint = "https://customer-api.open-meteo.com/v1/forecast"
+        hourly = _weather_json(endpoint + "?" + urlencode(parameters))["hourly"]
+        result = []
+        for date in dates:
+            rows = [(stamp, *(hourly[field][i] for field in (
+                "temperature_2m", "relative_humidity_2m", "wind_speed_10m",
+                "wind_direction_10m", "precipitation")))
+                for i, stamp in enumerate(hourly["time"]) if stamp.startswith(date)]
+            result.append(_aggregate_hours(date, rows))
+        return result
+    if provider == "WeatherAPI":
+        if days > 2:
+            raise ValueError("Free WeatherAPI does not cover this many full future days")
+        parameters = {"key": os.environ["WEATHERAPI_KEY"], "q": f"{lat},{lng}",
+            "days": days + 1, "aqi": "no", "alerts": "no"}
+        data = _weather_json("https://api.weatherapi.com/v1/forecast.json?" + urlencode(parameters))
+        records = {day["date"]: day for day in data["forecast"]["forecastday"]}
+        return [_aggregate_hours(date, [(h["time"], h["temp_c"], h["humidity"], h["wind_kph"],
+            h["wind_degree"], h["precip_mm"]) for h in records[date]["hour"]]) for date in dates]
+    if provider == "Visual Crossing":
+        # A forecast-only Timeline query; no historical/statistical weather substitution.
+        parameters = {"key": os.environ["VISUAL_CROSSING_API_KEY"], "unitGroup": "metric",
+            "include": "days,hours", "contentType": "json",
+            "elements": "datetime,temp,humidity,windspeed,winddir,precip,source"}
+        data = _weather_json(
+            f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/{lat},{lng}?"
+            + urlencode(parameters))
+        records = {day["datetime"]: day for day in data["days"]}
+        result = []
+        for date in dates:
+            day = records[date]
+            if day.get("source") not in (None, "fcst"):
+                raise ValueError("Expected forecast weather, not observations or climatology")
+            rows = []
+            for hour in day["hours"]:
+                if hour.get("source") not in (None, "fcst"):
+                    raise ValueError("Expected forecast hourly data")
+                rows.append((hour["datetime"], hour["temp"], hour["humidity"],
+                    hour["windspeed"], hour["winddir"], hour["precip"]))
+            result.append(_aggregate_hours(date, rows))
+        return result
+    raise ValueError("Unknown weather provider")
 
 
 def fetch_weather(lat: float, lng: float, days: int) -> list[WeatherData]:
-    global _WEATHER_BLOCKED_UNTIL, _WEATHER_LIMIT_REASON
-    # Serialize cache misses so simultaneous runs do not duplicate provider calls.
-    with _WEATHER_LOCK:
-        today = datetime.now(LOCAL_TZ).date().isoformat()
-        key = (round(lat, 4), round(lng, 4), today)
-        now = time.time()
-        for old_key, (created, _) in list(_WEATHER_CACHE.items()):
-            if now - created >= _WEATHER_TTL_SECONDS or old_key[2] != today:
-                del _WEATHER_CACHE[old_key]
-        cached = _WEATHER_CACHE.get(key)
-        if cached and len(cached[1]) >= days:
-            return [w.model_copy() for w in cached[1][:days]]
-        if now < _WEATHER_BLOCKED_UNTIL:
-            remaining = math.ceil(_WEATHER_BLOCKED_UNTIL - now)
-            raise HTTPException(503,
-                f"Weather provider rate limit: {_WEATHER_LIMIT_REASON}. "
-                f"Next server retry allowed in {remaining} seconds. "
-                "A valid cached forecast for this location and duration is not available.",
-                headers={"Retry-After": str(remaining)})
-        try:
-            forecast = _fetch_weather_uncached(lat, lng, days)
-        except HTTPException as exc:
-            cause = exc.__cause__
-            if isinstance(cause, HTTPError) and cause.code == 429:
-                reason = "Provider request limit exceeded"
-                try:
-                    reason = str(json.loads(cause.read()).get("reason", reason))[:240]
-                except (ValueError, OSError, AttributeError):
-                    pass
-                # Prefer the provider's Retry-After; otherwise distinguish quotas.
-                delay = 3600 if "hour" in reason.lower() else 60
-                if "daily" in reason.lower() or "day" in reason.lower():
-                    utc_now = datetime.now(timezone.utc)
-                    midnight = (utc_now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                    delay = max(60, math.ceil((midnight - utc_now).total_seconds()))
-                retry_after = cause.headers.get("Retry-After") if cause.headers else None
-                if retry_after:
-                    try:
-                        delay = max(1, int(retry_after))
-                    except ValueError:
-                        try:
-                            delay = max(1, math.ceil(parsedate_to_datetime(retry_after).timestamp() - time.time()))
-                        except (TypeError, ValueError, OverflowError):
-                            pass
-                _WEATHER_BLOCKED_UNTIL = time.time() + delay
-                _WEATHER_LIMIT_REASON = reason
-                raise HTTPException(503,
-                    f"Weather provider rate limit: {reason}. Next server retry allowed in {delay} seconds. "
-                    "If this persists on shared hosting, configure OPEN_METEO_API_KEY for a dedicated provider endpoint.",
-                    headers={"Retry-After": str(delay)}) from exc
-            raise
-        if len(_WEATHER_CACHE) >= 128:
-            del _WEATHER_CACHE[min(_WEATHER_CACHE, key=lambda k: _WEATHER_CACHE[k][0])]
-        _WEATHER_CACHE[key] = (time.time(), [w.model_copy() for w in forecast])
-        return forecast
-
-
-def _fetch_weather_uncached(lat: float, lng: float, days: int) -> list[WeatherData]:
-    """Full local days starting tomorrow; reject missing/partial forecasts."""
-    parameters = {"latitude": lat, "longitude": lng, "timezone": "Asia/Manila",
-                       "forecast_days": days + 1, "wind_speed_unit": "kmh",
-                       "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation"}
-    api_key = os.getenv("OPEN_METEO_API_KEY", "").strip()
-    endpoint = "https://api.open-meteo.com/v1/forecast"
-    if api_key:
-        parameters["apikey"] = api_key
-        endpoint = "https://customer-api.open-meteo.com/v1/forecast"
-    query = urlencode(parameters)
+    """Select a compatible provider, cache valid results, and skip failed providers."""
+    if not 1 <= days <= 14:
+        raise HTTPException(422, "Forecast duration must be between 1 and 14 days")
+    # Waiting clients reuse the successful result rather than duplicating requests.
+    if not _WEATHER_LOCK.acquire(timeout=10):
+        raise HTTPException(503, "Another forecast is still loading. Please retry shortly.")
     try:
-        # Retry temporary transport/provider failures within the dashboard timeout.
-        for attempt in range(2):
+        today = datetime.now(LOCAL_TZ).date().isoformat()
+        location = (round(lat, 4), round(lng, 4), today)
+        providers = weather_provider_order(days)
+        now = time.time()
+        for key, (created, _) in list(_WEATHER_CACHE.items()):
+            if now - created >= _WEATHER_TTL_SECONDS or key[2] != today:
+                del _WEATHER_CACHE[key]
+        # Any complete, fresh cached sequence beats another external request.
+        for provider in providers:
+            cached = _WEATHER_CACHE.get((*location, provider))
+            if cached and len(cached[1]) >= days:
+                return [w.model_copy(update={"cached": True}) for w in cached[1][:days]]
+        errors = []
+        for provider in providers:
+            blocked_until, reason = _WEATHER_COOLDOWNS.get(provider, (0, ""))
+            remaining = math.ceil(blocked_until - time.time())
+            if remaining > 0:
+                errors.append(f"{provider}: {reason}; retry in {remaining}s")
+                continue
             try:
-                with urlopen(endpoint + "?" + query, timeout=12) as response:
-                    hourly = json.load(response)["hourly"]
-                break
-            except HTTPError as exc:
-                if attempt == 0 and exc.code >= 500:
-                    time.sleep(1)
-                    continue
-                raise
-            except (URLError, TimeoutError, ConnectionError):
-                if attempt == 0:
-                    time.sleep(1)
-                    continue
-                raise
-        dates = [(datetime.now(LOCAL_TZ).date() + timedelta(days=i)).isoformat()
-                 for i in range(1, days + 1)]
-        result = []
-        for date in dates:
-            indices = [i for i, value in enumerate(hourly["time"]) if value.startswith(date)]
-            if len(indices) != 24:
-                raise ValueError(f"Incomplete forecast for {date}: expected 24 hours, received {len(indices)}")
-            values = {key: [float(hourly[key][i]) for i in indices] for key in
-                      ("temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m", "precipitation")}
-            if not all(math.isfinite(v) for series in values.values() for v in series):
-                raise ValueError("Non-finite forecast")
-            # Circular speed-weighted mean: 359 and 1 degrees average to north.
-            east = sum(s * math.sin(math.radians(d)) for s, d in zip(values["wind_speed_10m"], values["wind_direction_10m"]))
-            north = sum(s * math.cos(math.radians(d)) for s, d in zip(values["wind_speed_10m"], values["wind_direction_10m"]))
-            rain = sum(values["precipitation"])
-            result.append(WeatherData(date=date, temp_c=round(sum(values["temperature_2m"]) / 24, 2),
-                humidity=round(sum(values["relative_humidity_2m"]) / 24, 2),
-                wind_kph=round(sum(values["wind_speed_10m"]) / 24, 2),
-                wind_direction_deg=round(math.degrees(math.atan2(east, north)) % 360, 2),
-                precipitation_mm=round(rain, 2), condition="Rain forecast" if rain >= 1 else "Little or no rain forecast"))
-        return result
-    except HTTPError as exc:
-        logging.getLogger(__name__).exception("Open-Meteo HTTP failure")
-        message = ("Weather provider rate limit reached. Wait a minute and retry."
-                   if exc.code == 429 else
-                   f"Weather provider returned HTTP {exc.code}. Retry shortly; check the server log if it persists.")
-        raise HTTPException(503, message) from exc
-    except OSError as exc:
-        logging.getLogger(__name__).exception("Open-Meteo connection failure")
-        raise HTTPException(503,
-            "Simulation server could not connect to api.open-meteo.com after retrying. "
-            "Check the Python server's internet access, firewall, proxy and HTTPS certificates; then retry.") from exc
-    except (ValueError, KeyError, TypeError, IndexError) as exc:
-        logging.getLogger(__name__).exception("Open-Meteo incomplete or invalid forecast")
-        raise HTTPException(503,
-            "Weather provider returned incomplete or invalid hourly forecast data. "
-            "Try a shorter simulation duration or retry shortly. See the Python server log for the missing date or field.") from exc
+                forecast = _fetch_provider(provider, lat, lng, days)
+                if len(forecast) != days or [w.date for w in forecast] != _forecast_dates(days):
+                    raise ValueError("Forecast does not cover the requested dates")
+            except (ProviderFailure, ValueError, KeyError, TypeError, IndexError) as exc:
+                safe_reason = str(exc) if isinstance(exc, ProviderFailure) else "Incomplete or invalid hourly forecast"
+                delay = exc.cooldown if isinstance(exc, ProviderFailure) else 60
+                _WEATHER_COOLDOWNS[provider] = (time.time() + delay, safe_reason)
+                logging.getLogger(__name__).warning("%s forecast failed: %s", provider, safe_reason)
+                errors.append(f"{provider}: {safe_reason}; retry in {delay}s")
+                continue
+            fetched = datetime.now(timezone.utc).isoformat()
+            forecast = [w.model_copy(update={"provider": provider, "fetched_at": fetched, "cached": False}) for w in forecast]
+            if len(_WEATHER_CACHE) >= 128:
+                del _WEATHER_CACHE[min(_WEATHER_CACHE, key=lambda k: _WEATHER_CACHE[k][0])]
+            _WEATHER_CACHE[(*location, provider)] = (time.time(), [w.model_copy() for w in forecast])
+            _WEATHER_COOLDOWNS.pop(provider, None)
+            return forecast
+        missing = []
+        if days <= 2 and not os.getenv("WEATHERAPI_KEY", "").strip():
+            missing.append("WEATHERAPI_KEY")
+        if not os.getenv("VISUAL_CROSSING_API_KEY", "").strip():
+            missing.append("VISUAL_CROSSING_API_KEY")
+        detail = "No configured weather provider could supply the full forecast. " + "; ".join(errors)
+        if missing:
+            detail += ". Enable additional free providers with server environment variables: " + ", ".join(missing)
+        raise HTTPException(503, detail)
+    finally:
+        _WEATHER_LOCK.release()
 
 
 def suitability(w: WeatherData):
@@ -404,6 +493,9 @@ def simulate(req: SimRequest):
         base["weather_source"] = "User override (hypothetical constant weather)"
     else:
         weather = fetch_weather(lat, lng, req.days)
+        base["weather_source"] = weather[0].provider + " forecast" + (" (cached)" if weather[0].cached else "")
+        base["weather_fetched_at"] = weather[0].fetched_at
+        base["weather_cached"] = weather[0].cached
     model = MosquitoModel(selected, req.seed)
     for day, w in enumerate(weather, 1):
         deaths, births = model.step(w)
