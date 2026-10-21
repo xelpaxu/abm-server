@@ -12,6 +12,8 @@ import os
 import random
 import logging
 import time
+from threading import Lock
+from email.utils import parsedate_to_datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -94,20 +96,92 @@ def distance_m(lat1, lng1, lat2, lng2):
     return math.hypot(north, east)
 
 
+# Share recent validated forecasts between simulation runs in this worker.
+_WEATHER_CACHE = {}
+_WEATHER_LOCK = Lock()
+_WEATHER_TTL_SECONDS = 1800
+_WEATHER_BLOCKED_UNTIL = 0.0
+_WEATHER_LIMIT_REASON = ""
+
+
 def fetch_weather(lat: float, lng: float, days: int) -> list[WeatherData]:
+    global _WEATHER_BLOCKED_UNTIL, _WEATHER_LIMIT_REASON
+    # Serialize cache misses so simultaneous runs do not duplicate provider calls.
+    with _WEATHER_LOCK:
+        today = datetime.now(LOCAL_TZ).date().isoformat()
+        key = (round(lat, 4), round(lng, 4), today)
+        now = time.time()
+        for old_key, (created, _) in list(_WEATHER_CACHE.items()):
+            if now - created >= _WEATHER_TTL_SECONDS or old_key[2] != today:
+                del _WEATHER_CACHE[old_key]
+        cached = _WEATHER_CACHE.get(key)
+        if cached and len(cached[1]) >= days:
+            return [w.model_copy() for w in cached[1][:days]]
+        if now < _WEATHER_BLOCKED_UNTIL:
+            remaining = math.ceil(_WEATHER_BLOCKED_UNTIL - now)
+            raise HTTPException(503,
+                f"Weather provider rate limit: {_WEATHER_LIMIT_REASON}. "
+                f"Next server retry allowed in {remaining} seconds. "
+                "A valid cached forecast for this location and duration is not available.",
+                headers={"Retry-After": str(remaining)})
+        try:
+            forecast = _fetch_weather_uncached(lat, lng, days)
+        except HTTPException as exc:
+            cause = exc.__cause__
+            if isinstance(cause, HTTPError) and cause.code == 429:
+                reason = "Provider request limit exceeded"
+                try:
+                    reason = str(json.loads(cause.read()).get("reason", reason))[:240]
+                except (ValueError, OSError, AttributeError):
+                    pass
+                # Prefer the provider's Retry-After; otherwise distinguish quotas.
+                delay = 3600 if "hour" in reason.lower() else 60
+                if "daily" in reason.lower() or "day" in reason.lower():
+                    utc_now = datetime.now(timezone.utc)
+                    midnight = (utc_now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                    delay = max(60, math.ceil((midnight - utc_now).total_seconds()))
+                retry_after = cause.headers.get("Retry-After") if cause.headers else None
+                if retry_after:
+                    try:
+                        delay = max(1, int(retry_after))
+                    except ValueError:
+                        try:
+                            delay = max(1, math.ceil(parsedate_to_datetime(retry_after).timestamp() - time.time()))
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                _WEATHER_BLOCKED_UNTIL = time.time() + delay
+                _WEATHER_LIMIT_REASON = reason
+                raise HTTPException(503,
+                    f"Weather provider rate limit: {reason}. Next server retry allowed in {delay} seconds. "
+                    "If this persists on shared hosting, configure OPEN_METEO_API_KEY for a dedicated provider endpoint.",
+                    headers={"Retry-After": str(delay)}) from exc
+            raise
+        if len(_WEATHER_CACHE) >= 128:
+            del _WEATHER_CACHE[min(_WEATHER_CACHE, key=lambda k: _WEATHER_CACHE[k][0])]
+        _WEATHER_CACHE[key] = (time.time(), [w.model_copy() for w in forecast])
+        return forecast
+
+
+def _fetch_weather_uncached(lat: float, lng: float, days: int) -> list[WeatherData]:
     """Full local days starting tomorrow; reject missing/partial forecasts."""
-    query = urlencode({"latitude": lat, "longitude": lng, "timezone": "Asia/Manila",
+    parameters = {"latitude": lat, "longitude": lng, "timezone": "Asia/Manila",
                        "forecast_days": days + 1, "wind_speed_unit": "kmh",
-                       "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation"})
+                       "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation"}
+    api_key = os.getenv("OPEN_METEO_API_KEY", "").strip()
+    endpoint = "https://api.open-meteo.com/v1/forecast"
+    if api_key:
+        parameters["apikey"] = api_key
+        endpoint = "https://customer-api.open-meteo.com/v1/forecast"
+    query = urlencode(parameters)
     try:
         # Retry temporary transport/provider failures within the dashboard timeout.
         for attempt in range(2):
             try:
-                with urlopen("https://api.open-meteo.com/v1/forecast?" + query, timeout=12) as response:
+                with urlopen(endpoint + "?" + query, timeout=12) as response:
                     hourly = json.load(response)["hourly"]
                 break
             except HTTPError as exc:
-                if attempt == 0 and (exc.code == 429 or exc.code >= 500):
+                if attempt == 0 and exc.code >= 500:
                     time.sleep(1)
                     continue
                 raise
