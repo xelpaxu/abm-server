@@ -10,6 +10,9 @@ import json
 import math
 import os
 import random
+import logging
+import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -23,6 +26,9 @@ CLOSED = {"RESOLVED", "COMPLETED", "CLOSED", "DISMISSED", "REJECTED"}
 SEVERITY = {"CRITICAL": 1.0, "HIGH": 0.8, "MODERATE": 0.5, "MEDIUM": 0.5,
             "LOW": 0.2, "SAFE": 0.1, "OPEN": 0.5, "PENDING": 0.5,
             "VERIFIED": 0.5, "UNVERIFIED": 0.5, "IN PROGRESS": 0.5, "ASSIGNED": 0.5}
+# Reports stored before the risk vocabulary changed to CRITICAL/HIGH/MODERATE/LOW
+# carry the older display labels. Map them rather than rejecting the report.
+LEGACY_STATUS = {"HIGH RISK": "HIGH", "LOW RISK": "LOW", "MODERATE RISK": "MODERATE"}
 LIMITATIONS = [
     "Inspection scenario only: scores are relative priorities, not dengue probabilities or measured mosquito counts.",
     "Movement, seeding, survival and reproduction coefficients need local trap-data calibration; references support mechanisms, not these exact forecasts.",
@@ -58,6 +64,7 @@ class ReportIn(Schema):
     @classmethod
     def normalize_status(cls, value):
         value = value.strip().upper()
+        value = LEGACY_STATUS.get(value, value)
         if value not in SEVERITY and value not in CLOSED:
             raise ValueError("Unknown report status")
         return value
@@ -93,15 +100,29 @@ def fetch_weather(lat: float, lng: float, days: int) -> list[WeatherData]:
                        "forecast_days": days + 1, "wind_speed_unit": "kmh",
                        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation"})
     try:
-        with urlopen("https://api.open-meteo.com/v1/forecast?" + query, timeout=20) as response:
-            hourly = json.load(response)["hourly"]
+        # Retry temporary transport/provider failures within the dashboard timeout.
+        for attempt in range(2):
+            try:
+                with urlopen("https://api.open-meteo.com/v1/forecast?" + query, timeout=12) as response:
+                    hourly = json.load(response)["hourly"]
+                break
+            except HTTPError as exc:
+                if attempt == 0 and (exc.code == 429 or exc.code >= 500):
+                    time.sleep(1)
+                    continue
+                raise
+            except (URLError, TimeoutError, ConnectionError):
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                raise
         dates = [(datetime.now(LOCAL_TZ).date() + timedelta(days=i)).isoformat()
                  for i in range(1, days + 1)]
         result = []
         for date in dates:
             indices = [i for i, value in enumerate(hourly["time"]) if value.startswith(date)]
             if len(indices) != 24:
-                raise ValueError("Incomplete forecast")
+                raise ValueError(f"Incomplete forecast for {date}: expected 24 hours, received {len(indices)}")
             values = {key: [float(hourly[key][i]) for i in indices] for key in
                       ("temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m", "precipitation")}
             if not all(math.isfinite(v) for series in values.values() for v in series):
@@ -116,8 +137,22 @@ def fetch_weather(lat: float, lng: float, days: int) -> list[WeatherData]:
                 wind_direction_deg=round(math.degrees(math.atan2(east, north)) % 360, 2),
                 precipitation_mm=round(rain, 2), condition="Rain forecast" if rain >= 1 else "Little or no rain forecast"))
         return result
-    except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
-        raise HTTPException(503, "Weather forecast unavailable or incomplete. Retry later; no demo forecast was substituted.") from exc
+    except HTTPError as exc:
+        logging.getLogger(__name__).exception("Open-Meteo HTTP failure")
+        message = ("Weather provider rate limit reached. Wait a minute and retry."
+                   if exc.code == 429 else
+                   f"Weather provider returned HTTP {exc.code}. Retry shortly; check the server log if it persists.")
+        raise HTTPException(503, message) from exc
+    except OSError as exc:
+        logging.getLogger(__name__).exception("Open-Meteo connection failure")
+        raise HTTPException(503,
+            "Simulation server could not connect to api.open-meteo.com after retrying. "
+            "Check the Python server's internet access, firewall, proxy and HTTPS certificates; then retry.") from exc
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        logging.getLogger(__name__).exception("Open-Meteo incomplete or invalid forecast")
+        raise HTTPException(503,
+            "Weather provider returned incomplete or invalid hourly forecast data. "
+            "Try a shorter simulation duration or retry shortly. See the Python server log for the missing date or field.") from exc
 
 
 def suitability(w: WeatherData):
